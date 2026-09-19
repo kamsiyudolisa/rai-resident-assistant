@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
+from supabase import Client, create_client
 
 st.set_page_config(page_title="RAI", page_icon="🏠", layout="wide")
 
@@ -120,6 +121,14 @@ def get_secret(name):
     except (KeyError, FileNotFoundError):
         return os.getenv(name)
 
+@st.cache_resource
+def get_supabase() -> Client:
+    url = get_secret("SUPABASE_URL")
+    key = get_secret("SUPABASE_SECRET_KEY")
+    if not url or not key:
+        raise RuntimeError("Add SUPABASE_URL and SUPABASE_SECRET_KEY to Streamlit secrets.")
+    return create_client(url, key)
+
 def build_catalog():
     lines = [f"{r['Entry ID']} | {r['Category']} | Question: {r['Resident Question']} | Verified answer: {r['Correct Answer']}" for _, r in knowledge_base.iterrows()]
     lines += [f"{r['Entry ID']} | {r['Category']} | Question: {r['Resident Question']} | Verified answer: {r['Correct Answer']}" for r in UPDATES]
@@ -160,8 +169,47 @@ def select_information(question):
     return None if entry_id == "UNKNOWN" else find_entry(entry_id)
 
 def log_question(question, match):
-    row = {"Timestamp":datetime.now(timezone.utc).isoformat(),"Resident Question":question,"Entry ID":"UNKNOWN" if match is None else match["Entry ID"],"Category":"Unknown" if match is None else match["Category"],"Urgency":"Unknown" if match is None else match["Urgency"],"Verified Answer Found":match is not None}
-    pd.DataFrame([row]).to_csv("ra_question_log.csv",mode="a",header=not os.path.exists("ra_question_log.csv"),index=False)
+    row = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "resident_question": question,
+        "entry_id": "UNKNOWN" if match is None else str(match["Entry ID"]),
+        "category": "Unknown" if match is None else str(match["Category"]),
+        "urgency": "Unknown" if match is None else str(match["Urgency"]),
+        "verified_answer_found": match is not None,
+        "source": "live",
+    }
+    get_supabase().table("question_logs").insert(row).execute()
+
+def load_question_log():
+    response = (
+        get_supabase()
+        .table("question_logs")
+        .select("created_at,resident_question,entry_id,category,urgency,verified_answer_found")
+        .order("created_at")
+        .execute()
+    )
+    log = pd.DataFrame(response.data or [])
+    if log.empty:
+        return pd.DataFrame(
+            columns=[
+                "Timestamp",
+                "Resident Question",
+                "Entry ID",
+                "Category",
+                "Urgency",
+                "Verified Answer Found",
+            ]
+        )
+    return log.rename(
+        columns={
+            "created_at": "Timestamp",
+            "resident_question": "Resident Question",
+            "entry_id": "Entry ID",
+            "category": "Category",
+            "urgency": "Urgency",
+            "verified_answer_found": "Verified Answer Found",
+        }
+    )
 
 def image64(path):
     return base64.b64encode(Path(path).read_bytes()).decode()
@@ -262,7 +310,7 @@ def assistant():
         render_chat_message("user",question)
         with st.spinner("Checking verified information..."):
             try:
-                match=select_information(question); log_question(question,match)
+                match=select_information(question)
                 if match is None:
                     text="I couldn't find verified information for that question. Please contact your RA for assistance.\n\nCategory: Unknown\nUrgency: Unknown"
                 else:
@@ -271,6 +319,12 @@ def assistant():
             except Exception as error:
                 text="RAI couldn't connect to the language model. Check the API key and try again."
                 st.error(text); st.caption(str(error))
+            else:
+                try:
+                    log_question(question,match)
+                except Exception as error:
+                    st.warning("RAI answered, but this question could not be saved to analytics.")
+                    st.caption(str(error))
         st.session_state.messages.append({"role":"assistant","content":text})
 
 def ra_login():
@@ -314,8 +368,12 @@ def insights():
     with a: st.markdown('<div class="hero-title">RA Insights</div>',unsafe_allow_html=True)
     with b:
         if st.button("Log out",use_container_width=True): st.session_state.ra_authenticated=False; st.rerun()
-    if not os.path.exists("ra_question_log.csv"): st.info("No resident questions have been recorded yet."); return
-    log=pd.read_csv("ra_question_log.csv")
+    try:
+        log=load_question_log()
+    except Exception as error:
+        st.error("RAI couldn't load the permanent analytics database.")
+        st.caption(str(error))
+        return
     if log.empty: st.info("No resident questions have been recorded yet."); return
     verified=log["Verified Answer Found"].astype(str).str.lower().eq("true").sum()
     unanswered_count=len(log)-verified
@@ -328,7 +386,7 @@ def insights():
         with st.container(border=True):
             chart_header("Questions by category", "See what residents need help with most.")
             category_data=log["Category"].fillna("Unknown").value_counts().rename_axis("Category").reset_index(name="Questions")
-            st.vega_lite_chart(category_data,{"height":280,"mark":{"type":"bar","cornerRadiusEnd":9,"size":24},"encoding":{"x":{"field":"Questions","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Category","type":"nominal","title":None,"sort":"-x","axis":{"labelLimit":170}},"color":{"field":"Category","type":"nominal","legend":None,"scale":{"range":TSU_CHART_COLORS}},"tooltip":[{"field":"Category","type":"nominal"},{"field":"Questions","type":"quantitative"}]},"config":chart_config()},use_container_width=True)
+            st.vega_lite_chart(category_data,{"height":280,"background":"#ffffff","mark":{"type":"bar","cornerRadiusEnd":9,"size":24},"encoding":{"x":{"field":"Questions","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Category","type":"nominal","title":None,"sort":"-x","axis":{"labelLimit":170}},"color":{"field":"Category","type":"nominal","legend":None,"scale":{"range":TSU_CHART_COLORS}},"tooltip":[{"field":"Category","type":"nominal"},{"field":"Questions","type":"quantitative"}]},"config":chart_config()},use_container_width=True,theme=None)
     with c2:
         with st.container(border=True):
             chart_header("Most-used answer entries", "Identify which verified resources residents rely on.")
@@ -336,7 +394,7 @@ def insights():
             if used_entries.empty:
                 st.info("No verified answer entries have been used yet.")
             else:
-                st.vega_lite_chart(used_entries,{"height":280,"layer":[{"mark":{"type":"bar","size":6,"color":"#d9c5cb","cornerRadiusEnd":4},"encoding":{"x":{"field":"Uses","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Entry","type":"nominal","title":None,"sort":"-x"}}},{"mark":{"type":"point","filled":True,"size":230,"color":"#6f263d","stroke":"#f8eef1","strokeWidth":3},"encoding":{"x":{"field":"Uses","type":"quantitative"},"y":{"field":"Entry","type":"nominal","sort":"-x"},"tooltip":[{"field":"Entry","type":"nominal"},{"field":"Uses","type":"quantitative"}]}}],"config":chart_config()},use_container_width=True)
+                st.vega_lite_chart(used_entries,{"height":280,"background":"#ffffff","layer":[{"mark":{"type":"bar","size":6,"color":"#d9c5cb","cornerRadiusEnd":4},"encoding":{"x":{"field":"Uses","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Entry","type":"nominal","title":None,"sort":"-x"}}},{"mark":{"type":"point","filled":True,"size":230,"color":"#6f263d","stroke":"#f8eef1","strokeWidth":3},"encoding":{"x":{"field":"Uses","type":"quantitative"},"y":{"field":"Entry","type":"nominal","sort":"-x"},"tooltip":[{"field":"Entry","type":"nominal"},{"field":"Uses","type":"quantitative"}]}}],"config":chart_config()},use_container_width=True,theme=None)
     c1,c2=st.columns(2)
     with c1:
         with st.container(border=True):
@@ -348,12 +406,12 @@ def insights():
             else:
                 daily_questions["Date"]=pd.to_datetime(daily_questions["Date"])
                 time_encoding={"x":{"field":"Date","type":"temporal","title":None},"y":{"field":"Questions","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"tooltip":[{"field":"Date","type":"temporal"},{"field":"Questions","type":"quantitative"}]}
-                st.vega_lite_chart(daily_questions,{"height":280,"layer":[{"mark":{"type":"area","color":"#963e5b","opacity":.16},"encoding":time_encoding},{"mark":{"type":"line","color":"#6f263d","strokeWidth":3},"encoding":time_encoding},{"mark":{"type":"point","filled":True,"color":"#c8a96b","stroke":"#6f263d","strokeWidth":2,"size":90},"encoding":time_encoding}],"config":chart_config()},use_container_width=True)
+                st.vega_lite_chart(daily_questions,{"height":280,"background":"#ffffff","layer":[{"mark":{"type":"area","color":"#963e5b","opacity":.16},"encoding":time_encoding},{"mark":{"type":"line","color":"#6f263d","strokeWidth":3},"encoding":time_encoding},{"mark":{"type":"point","filled":True,"color":"#c8a96b","stroke":"#6f263d","strokeWidth":2,"size":90},"encoding":time_encoding}],"config":chart_config()},use_container_width=True,theme=None)
     with c2:
         with st.container(border=True):
             chart_header("Most-asked questions", "Understand the exact wording residents use.")
             top_questions=log["Resident Question"].astype(str).value_counts().head(7).rename_axis("Question").reset_index(name="Times asked")
-            st.vega_lite_chart(top_questions,{"height":280,"mark":{"type":"bar","cornerRadiusEnd":9,"size":23},"encoding":{"x":{"field":"Times asked","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Question","type":"nominal","title":None,"sort":"-x","axis":{"labelLimit":190}},"color":{"field":"Times asked","type":"quantitative","legend":None,"scale":{"range":["#d9c5cb","#6f263d"]}},"tooltip":[{"field":"Question","type":"nominal"},{"field":"Times asked","type":"quantitative"}]},"config":chart_config()},use_container_width=True)
+            st.vega_lite_chart(top_questions,{"height":280,"background":"#ffffff","mark":{"type":"bar","cornerRadiusEnd":9,"size":23},"encoding":{"x":{"field":"Times asked","type":"quantitative","title":None,"axis":{"tickMinStep":1}},"y":{"field":"Question","type":"nominal","title":None,"sort":"-x","axis":{"labelLimit":190}},"color":{"field":"Times asked","type":"quantitative","legend":None,"scale":{"range":["#d9c5cb","#6f263d"]}},"tooltip":[{"field":"Question","type":"nominal"},{"field":"Times asked","type":"quantitative"}]},"config":chart_config()},use_container_width=True,theme=None)
     st.markdown('<div class="section-ribbon yellow">Unanswered questions</div>',unsafe_allow_html=True)
     unanswered=log[log["Entry ID"].eq("UNKNOWN")][["Timestamp","Resident Question"]]
     if unanswered.empty:
